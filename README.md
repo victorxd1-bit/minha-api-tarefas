@@ -25,5 +25,5 @@ py -m uvicorn main:app --reload
 - ## Acesse (produção)
 - Docs: https://minha-api-tarefas.onrender.com/docs
 - Ping: https://minha-api-tarefas.onrender.com/ping
-up
+
 
