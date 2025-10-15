@@ -21,3 +21,8 @@ py -m uvicorn main:app --reload
 ## Acesse (local)
 - Docs interativas (Swagger): http://127.0.0.1:8000/docs  
 - Saúde (ping): http://127.0.0.1:8000/ping
+
+- ## Acesse (produção)
+- Docs: https://minha-api-tarefas.onrender.com/docs
+- Ping: https://minha-api-tarefas.onrender.com/ping
+
