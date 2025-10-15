@@ -4,6 +4,8 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends
 from sqlmodel import SQLModel, Field, Session, create_engine, select
+from fastapi.responses import RedirectResponse
+
 
 app = FastAPI()
 
@@ -44,13 +46,10 @@ SessionDep = Annotated[Session, Depends(get_session)]
 def ping():
     return {"status": "ok"}
     
-@app.get("/", include_in_schema=False)
+@app.get("/")  # deixa sem include_in_schema para aparecer no /docs
 def root():
-    return {
-        "message": "API de tarefas online 👍",
-        "docs": "/docs",
-        "ping": "/ping"
-    }
+    return RedirectResponse(url="/docs")
+
 
 
 # ===== 5) CRUD USANDO O BANCO =====
@@ -110,6 +109,7 @@ def delete_task(task_id: int, session: SessionDep):
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+
 
 
 
