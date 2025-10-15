@@ -43,6 +43,15 @@ SessionDep = Annotated[Session, Depends(get_session)]
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+    
+@app.get("/", include_in_schema=False)
+def root():
+    return {
+        "message": "API de tarefas online 👍",
+        "docs": "/docs",
+        "ping": "/ping"
+    }
+
 
 # ===== 5) CRUD USANDO O BANCO =====
 # Listar todas
@@ -101,6 +110,7 @@ def delete_task(task_id: int, session: SessionDep):
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+
 
 
 
