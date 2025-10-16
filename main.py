@@ -1,9 +1,11 @@
 # main.py
-from typing import Optional, Annotated, List
+from typing import Optional, Annotated, List, Literal
 from datetime import datetime
+import os
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query, Security
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import field_validator
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 
@@ -71,6 +73,14 @@ def get_session():
 
 SessionDep = Annotated[Session, Depends(get_session)]
 
+# ===== 3.1) AUTH – Token Bearer =====
+security = HTTPBearer()
+API_TOKEN = os.getenv("API_TOKEN", "dev-token")  # defina no Render depois
+
+def require_token(creds: HTTPAuthorizationCredentials = Security(security)):
+    if creds.credentials != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 # ===== 4) SAÚDE =====
 @app.get("/ping")
 def ping():
@@ -81,14 +91,24 @@ def root():
     return RedirectResponse(url="/docs")
 
 # ===== 5) CRUD USANDO O BANCO =====
-# Listar todas
+# Listar todas, com filtros/paginação/ordem
 @app.get("/tasks", response_model=List[Task])
-def list_tasks(session: SessionDep):
-    stmt = select(Task).order_by(Task.id)
+def list_tasks(
+    session: SessionDep,
+    done: Optional[bool] = None,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort: Literal["newest", "oldest"] = "newest",
+):
+    stmt = select(Task)
+    if done is not None:
+        stmt = stmt.where(Task.done == done)
+    order_col = Task.created_at.desc() if sort == "newest" else Task.created_at
+    stmt = stmt.order_by(order_col).offset(offset).limit(limit)
     return session.exec(stmt).all()
 
-# Criar
-@app.post("/tasks", response_model=Task, status_code=201)
+# Criar (protege com token)
+@app.post("/tasks", response_model=Task, status_code=201, dependencies=[Depends(require_token)])
 def create_task(data: TaskCreate, session: SessionDep):
     # checa duplicidade de título
     exists = session.exec(
@@ -111,8 +131,8 @@ def get_task(task_id: int, session: SessionDep):
         raise HTTPException(status_code=404, detail="Task não encontrada")
     return task
 
-# Atualizar (parcial)
-@app.patch("/tasks/{task_id}", response_model=Task)
+# Atualizar (parcial) – protegido
+@app.patch("/tasks/{task_id}", response_model=Task, dependencies=[Depends(require_token)])
 def update_task(task_id: int, data: TaskUpdate, session: SessionDep):
     task = session.get(Task, task_id)
     if not task:
@@ -130,8 +150,8 @@ def update_task(task_id: int, data: TaskUpdate, session: SessionDep):
     session.refresh(task)
     return task
 
-# Apagar
-@app.delete("/tasks/{task_id}", status_code=204)
+# Apagar – protegido
+@app.delete("/tasks/{task_id}", status_code=204, dependencies=[Depends(require_token)])
 def delete_task(task_id: int, session: SessionDep):
     task = session.get(Task, task_id)
     if not task:
@@ -144,6 +164,8 @@ def delete_task(task_id: int, session: SessionDep):
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+
+
 
 
 
