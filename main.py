@@ -1,13 +1,11 @@
 # main.py
 from typing import Optional, Annotated, List
 from datetime import datetime
-from pydantic import field_validator
-from fastapi import FastAPI, HTTPException, Depends
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-from fastapi.responses import RedirectResponse
-from fastapi import HTTPException
-from sqlmodel import select
 
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import RedirectResponse
+from pydantic import field_validator
+from sqlmodel import SQLModel, Field, Session, create_engine, select
 
 app = FastAPI()
 
@@ -24,7 +22,6 @@ class TaskCreate(SQLModel):
     title: str = Field(min_length=3, max_length=80)
     description: Optional[str] = Field(default=None, max_length=300)
 
-    # 1) tira espaços
     @field_validator("title", "description", mode="before")
     @classmethod
     def strip_spaces(cls, v):
@@ -32,7 +29,6 @@ class TaskCreate(SQLModel):
             return v.strip()
         return v
 
-    # 2) impede título “em branco” (só espaços)
     @field_validator("title")
     @classmethod
     def title_not_blank(cls, v: str):
@@ -41,7 +37,6 @@ class TaskCreate(SQLModel):
         return v
 
 class TaskUpdate(SQLModel):
-    # todos opcionais (atualização parcial)
     title: Optional[str] = Field(default=None, min_length=3, max_length=80)
     description: Optional[str] = Field(default=None, max_length=300)
     done: Optional[bool] = None
@@ -80,12 +75,10 @@ SessionDep = Annotated[Session, Depends(get_session)]
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-    
+
 @app.get("/")  # deixa sem include_in_schema para aparecer no /docs
 def root():
     return RedirectResponse(url="/docs")
-
-
 
 # ===== 5) CRUD USANDO O BANCO =====
 # Listar todas
@@ -97,7 +90,8 @@ def list_tasks(session: SessionDep):
 # Criar
 @app.post("/tasks", response_model=Task, status_code=201)
 def create_task(data: TaskCreate, session: SessionDep):
-  exists = session.exec(
+    # checa duplicidade de título
+    exists = session.exec(
         select(Task).where(Task.title == data.title)
     ).first()
     if exists:
