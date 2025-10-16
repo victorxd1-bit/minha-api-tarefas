@@ -1,10 +1,12 @@
 # main.py
 from typing import Optional, Annotated, List
 from datetime import datetime
-
+from pydantic import field_validator
 from fastapi import FastAPI, HTTPException, Depends
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from fastapi.responses import RedirectResponse
+from fastapi import HTTPException
+from sqlmodel import select
 
 
 app = FastAPI()
@@ -19,13 +21,46 @@ class Task(SQLModel, table=True):
 
 # Esquemas de entrada/atualização (o que a API recebe)
 class TaskCreate(SQLModel):
-    title: str
-    description: Optional[str] = None
+    title: str = Field(min_length=3, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=300)
+
+    # 1) tira espaços
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def strip_spaces(cls, v):
+        if isinstance(v, str):
+            return v.strip()
+        return v
+
+    # 2) impede título “em branco” (só espaços)
+    @field_validator("title")
+    @classmethod
+    def title_not_blank(cls, v: str):
+        if not v or not v.strip():
+            raise ValueError("title não pode ser vazio")
+        return v
 
 class TaskUpdate(SQLModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
+    # todos opcionais (atualização parcial)
+    title: Optional[str] = Field(default=None, min_length=3, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=300)
     done: Optional[bool] = None
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def strip_spaces(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+        return v
+
+    @field_validator("title")
+    @classmethod
+    def title_if_present_not_blank(cls, v: Optional[str]):
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("title não pode ser vazio")
+        return v
 
 # ===== 2) BANCO/ENGINE/TABELAS =====
 DATABASE_URL = "sqlite:///tasks.db"  # arquivo tasks.db na pasta do projeto
@@ -62,6 +97,12 @@ def list_tasks(session: SessionDep):
 # Criar
 @app.post("/tasks", response_model=Task, status_code=201)
 def create_task(data: TaskCreate, session: SessionDep):
+  exists = session.exec(
+        select(Task).where(Task.title == data.title)
+    ).first()
+    if exists:
+        raise HTTPException(status_code=409, detail="Já existe uma task com esse título")
+
     task = Task(title=data.title, description=data.description)
     session.add(task)
     session.commit()
@@ -109,6 +150,7 @@ def delete_task(task_id: int, session: SessionDep):
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+
 
 
 
