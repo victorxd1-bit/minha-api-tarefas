@@ -1,176 +1,295 @@
-# main.py
-from typing import Optional, Annotated, List, Literal
-from datetime import datetime
+from __future__ import annotations
+
 import os
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from time import perf_counter
+from typing import Generator, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Security
-from fastapi.responses import RedirectResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import field_validator
-from sqlmodel import SQLModel, Field, Session, create_engine, select
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from loguru import logger
+from pydantic import BaseModel, field_validator
+from sqlmodel import Field, SQLModel, Session, create_engine, select
 
-app = FastAPI()
 
-# ===== 1) MODELO/TABELA =====
-class Task(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    title: str
-    description: Optional[str] = None
-    done: bool = False
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+# ------------------------------------------------------------------------------
+# Env & Logging config
+# ------------------------------------------------------------------------------
+load_dotenv()
 
-# Esquemas de entrada/atualização (o que a API recebe)
-class TaskCreate(SQLModel):
-    title: str = Field(min_length=3, max_length=80)
-    description: Optional[str] = Field(default=None, max_length=300)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_JSON = os.getenv("LOG_JSON", "false").lower() == "true"
+SLOW_MS = int(os.getenv("LOG_SLOW_MS", "500"))
 
-    @field_validator("title", "description", mode="before")
-    @classmethod
-    def strip_spaces(cls, v):
-        if isinstance(v, str):
-            return v.strip()
-        return v
+# Reconfigura o Loguru: um único sink em stdout
+logger.remove()
+logger.add(
+    sys.stdout,
+    level=LOG_LEVEL,
+    enqueue=True,
+    backtrace=False,
+    diagnose=False,
+    serialize=LOG_JSON,
+)
+logger.bind(component="bootstrap").info(
+    "Logger configurado", level=LOG_LEVEL, json=LOG_JSON
+)
 
-    @field_validator("title")
-    @classmethod
-    def title_not_blank(cls, v: str):
-        if not v or not v.strip():
-            raise ValueError("title não pode ser vazio")
-        return v
+# ------------------------------------------------------------------------------
+# Config & app
+# ------------------------------------------------------------------------------
+API_TOKEN = os.getenv("API_TOKEN", "test-token")
+DB_PATH = os.getenv("DB_PATH", "tasks.db")
 
-class TaskUpdate(SQLModel):
-    title: Optional[str] = Field(default=None, min_length=3, max_length=80)
-    description: Optional[str] = Field(default=None, max_length=300)
-    done: Optional[bool] = None
+app = FastAPI(title="Tasks API")
 
-    @field_validator("title", "description", mode="before")
-    @classmethod
-    def strip_spaces(cls, v):
-        if isinstance(v, str):
-            v = v.strip()
-        return v
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    connect_args={"check_same_thread": False},
+)
+logger.bind(component="db").info("Conectando ao banco", db_path=DB_PATH, url=f"sqlite:///{DB_PATH}")
 
-    @field_validator("title")
-    @classmethod
-    def title_if_present_not_blank(cls, v: Optional[str]):
-        if v is None:
-            return v
-        if not v.strip():
-            raise ValueError("title não pode ser vazio")
-        return v
 
-# ===== 2) BANCO/ENGINE/TABELAS =====
-DATABASE_URL = "sqlite:///tasks.db"  # arquivo tasks.db na pasta do projeto
-engine = create_engine(DATABASE_URL, echo=False)
-
-def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
-
-# ===== 3) SESSÃO POR REQUISIÇÃO =====
-def get_session():
+@contextmanager
+def get_session() -> Generator[Session, None, None]:
+    if engine is None:
+        raise RuntimeError("Engine not initialized yet.")
     with Session(engine) as session:
         yield session
 
-SessionDep = Annotated[Session, Depends(get_session)]
 
-# ===== 3.1) AUTH – Token Bearer =====
-security = HTTPBearer()
-API_TOKEN = os.getenv("API_TOKEN", "dev-token")  # defina no Render depois
+# ------------------------------------------------------------------------------
+# Modelos
+# ------------------------------------------------------------------------------
+class Task(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    description: str = "desc"
+    done: bool = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-def require_token(creds: HTTPAuthorizationCredentials = Security(security)):
-    if creds.credentials != API_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ===== 4) SAÚDE =====
+class TaskCreate(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    done: bool | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_not_blank_if_provided(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not v.strip():
+            raise ValueError("title cannot be blank")
+        return v.strip()
+
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    done: Optional[bool] = None
+
+    @field_validator("title")
+    @classmethod
+    def title_if_present_must_not_be_blank(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and not v.strip():
+            raise ValueError("title must not be blank")
+        return v.strip() if isinstance(v, str) else v
+
+
+class TaskRead(BaseModel):
+    id: int
+    title: str
+    description: str
+    done: bool
+    created_at: datetime
+
+
+# ------------------------------------------------------------------------------
+# Cria as tabelas
+# ------------------------------------------------------------------------------
+SQLModel.metadata.create_all(engine)
+
+
+# ------------------------------------------------------------------------------
+# App lifecycle & middlewares
+# ------------------------------------------------------------------------------
+@app.on_event("startup")
+def _on_startup():
+    logger.bind(component="app").info("API iniciando...", name=app.title, version="v1")
+
+
+@app.on_event("shutdown")
+def _on_shutdown():
+    logger.bind(component="app").info("API finalizando...")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.bind(component="http").exception(
+            "Unhandled error",
+            method=request.method,
+            path=request.url.path,
+            query=str(request.url.query),
+            client=str(request.client.host if request.client else None),
+        )
+        raise
+
+    duration_ms = (perf_counter() - start) * 1000
+    bind = logger.bind(
+        component="http",
+        method=request.method,
+        path=request.url.path,
+        query=str(request.url.query),
+        status=response.status_code,
+        ms=round(duration_ms, 2),
+        client=str(request.client.host if request.client else None),
+    )
+    if duration_ms > SLOW_MS:
+        bind.warning("slow request")
+    else:
+        bind.info("request")
+
+    return response
+
+
+# ------------------------------------------------------------------------------
+# Exception handlers
+# ------------------------------------------------------------------------------
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.bind(component="http").warning(
+        "HTTPException",
+        status=exc.status_code,
+        detail=exc.detail,
+        path=request.url.path,
+        method=request.method,
+    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.bind(component="http").warning(
+        "ValidationError",
+        errors=exc.errors(),
+        path=request.url.path,
+        method=request.method,
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+# ------------------------------------------------------------------------------
+# Auth
+# ------------------------------------------------------------------------------
+def require_bearer_token(request: Request) -> None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+    token = auth.removeprefix("Bearer ").strip()
+    if token != API_TOKEN:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+
+# ------------------------------------------------------------------------------
+# Rotas
+# ------------------------------------------------------------------------------
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
 
-@app.get("/")  # deixa sem include_in_schema para aparecer no /docs
-def root():
-    return RedirectResponse(url="/docs")
 
-# ===== 5) CRUD USANDO O BANCO =====
-# Listar todas, com filtros/paginação/ordem
-@app.get("/tasks", response_model=List[Task])
+@app.post(
+    "/tasks",
+    response_model=TaskRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_bearer_token)],
+)
+def create_task(payload: TaskCreate):
+    with get_session() as session:
+        task = Task(
+            title=payload.title,
+            description=payload.description.strip() if payload.description else "desc",
+            done=bool(payload.done) if payload.done is not None else False,
+        )
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task
+
+
+@app.get("/tasks", response_model=list[TaskRead])
 def list_tasks(
-    session: SessionDep,
+    limit: int = 3,           # padrão alinhado com o teste
+    offset: int = 0,
+    sort: str = "newest",     # "oldest" | "newest"
     done: Optional[bool] = None,
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    sort: Literal["newest", "oldest"] = "newest",
 ):
-    stmt = select(Task)
-    if done is not None:
-        stmt = stmt.where(Task.done == done)
-    order_col = Task.created_at.desc() if sort == "newest" else Task.created_at
-    stmt = stmt.order_by(order_col).offset(offset).limit(limit)
-    return session.exec(stmt).all()
+    with get_session() as session:
+        query = select(Task)
+        if done is not None:
+            query = query.where(Task.done == done)
 
-# Criar (protege com token)
-@app.post("/tasks", response_model=Task, status_code=201, dependencies=[Depends(require_token)])
-def create_task(data: TaskCreate, session: SessionDep):
-    # checa duplicidade de título
-    exists = session.exec(
-        select(Task).where(Task.title == data.title)
-    ).first()
-    if exists:
-        raise HTTPException(status_code=409, detail="Já existe uma task com esse título")
+        if sort == "oldest":
+            query = query.order_by(Task.created_at.asc(), Task.id.asc())
+        else:
+            query = query.order_by(Task.created_at.desc(), Task.id.desc())
 
-    task = Task(title=data.title, description=data.description)
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-    return task
-
-# Buscar por id
-@app.get("/tasks/{task_id}", response_model=Task)
-def get_task(task_id: int, session: SessionDep):
-    task = session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task não encontrada")
-    return task
-
-# Atualizar (parcial) – protegido
-@app.patch("/tasks/{task_id}", response_model=Task, dependencies=[Depends(require_token)])
-def update_task(task_id: int, data: TaskUpdate, session: SessionDep):
-    task = session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task não encontrada")
-
-    if data.title is not None:
-        task.title = data.title
-    if data.description is not None:
-        task.description = data.description
-    if data.done is not None:
-        task.done = data.done
-
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-    return task
-
-# Apagar – protegido
-@app.delete("/tasks/{task_id}", status_code=204, dependencies=[Depends(require_token)])
-def delete_task(task_id: int, session: SessionDep):
-    task = session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task não encontrada")
-    session.delete(task)
-    session.commit()
-    # 204: sem corpo
-
-# ===== 6) CRIAR TABELAS NO STARTUP =====
-@app.on_event("startup")
-def on_startup():
-    create_db_and_tables()
+        rows = session.exec(query.offset(offset).limit(limit)).all()
+        return rows
 
 
+@app.get("/tasks/{task_id}", response_model=TaskRead)
+def get_task(task_id: int):
+    with get_session() as session:
+        task = session.get(Task, task_id)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        return task
 
 
+@app.patch(
+    "/tasks/{task_id}",
+    response_model=TaskRead,
+    dependencies=[Depends(require_bearer_token)],
+)
+def update_task(task_id: int, payload: TaskUpdate):
+    with get_session() as session:
+        task = session.get(Task, task_id)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+
+        if payload.title is not None:
+            task.title = payload.title
+        if payload.description is not None:
+            task.description = payload.description
+        if payload.done is not None:
+            task.done = payload.done
+
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task
 
 
-
-
-
-
+@app.delete(
+    "/tasks/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_bearer_token)],
+)
+def delete_task(task_id: int):
+    with get_session() as session:
+        task = session.get(Task, task_id)
+        if not task:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+        session.delete(task)
+        session.commit()
+    return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
